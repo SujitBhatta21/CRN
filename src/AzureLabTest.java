@@ -16,13 +16,6 @@
 // But please be aware it does not test all of the features so you will need to modify it or
 // write your own tests to show everything works.
 
-import java.net.DatagramPacket;
-import java.net.DatagramSocket;
-import java.net.InetAddress;
-import java.nio.charset.StandardCharsets;
-import java.util.Date;
-import java.util.Random;
-
 class AzureLabTest {
     public static void main (String [] args) {
         String emailAddress = "sujit.bhatta@city.ac.uk";

@@ -17,6 +17,7 @@ import java.io.IOException;
 import java.net.*;
 import java.security.MessageDigest;
 import java.util.*;
+import java.util.concurrent.ConcurrentHashMap;
 
 interface NodeInterface {
 
@@ -94,6 +95,9 @@ public class Node implements NodeInterface {
     private final Stack<String> relayStack = new Stack<>();
     private final Map<String, InetSocketAddress> addressBook = new HashMap<>();
     private final Map<String, String> nearestResponseCache = new HashMap<>();
+    // Map to track pending requests
+    private Map<String, PendingRequest> pendingRequests = new ConcurrentHashMap<>();
+    private Set<String> processedTxIDs = Collections.synchronizedSet(new HashSet<>());
     private final Random random = new Random();
     private String lastReadResult = null;
     private final boolean debug = false;
@@ -104,10 +108,56 @@ public class Node implements NodeInterface {
         this.nodeName = nodeName;
     }
 
+
+    private static final long TIMEOUT = 5000; // Timeout in milliseconds
+    private static final int MAX_RETRIES = 3;
+
+    private void startPendingRequestChecker() {
+        new Thread(() -> {
+            while (true) {
+                try {
+                    // Copy values to avoid concurrent modification
+                    for (PendingRequest req : new ArrayList<>(pendingRequests.values())) {
+                        if (System.currentTimeMillis() - req.timestamp > TIMEOUT) {
+                            if (req.retries < MAX_RETRIES) {
+                                req.retries++;
+                                req.timestamp = System.currentTimeMillis();
+                                // Resend the request message
+                                sendResponse(req.target.getAddress(), req.target.getPort(), req.message);
+                                if (debug) System.out.println("Resending message: " + req.message);
+                            } else {
+                                // Give up on this request after MAX_RETRIES
+                                if (debug) System.out.println("Max retries reached for txID " + req.txID);
+                                pendingRequests.remove(req.txID);
+                            }
+                        }
+                    }
+                    Thread.sleep(100); // Check every 100 ms
+                } catch (InterruptedException e) {
+                    Thread.currentThread().interrupt();
+                    break;
+                }
+            }
+        }).start();
+    }
+
+
+    private String buildRequestMessage(String txID, String type, String... params) {
+        StringBuilder sb = new StringBuilder();
+        sb.append(txID).append(" ").append(type).append(" ");
+        // For each parameter, apply your encoding (which adds the space count and trailing space)
+        for (String param : params) {
+            sb.append(encode(param));
+        }
+        return sb.toString();
+    }
+
+
     @Override
     public void openPort(int portNumber) throws Exception {
         this.socket = new DatagramSocket(portNumber);
         if (debug) System.out.println("Listening on UDP port " + portNumber);
+        startPendingRequestChecker();
     }
 
     @Override
@@ -130,11 +180,79 @@ public class Node implements NodeInterface {
         try {
             String[] parts = message.trim().split(" ", 3);
             if (parts.length < 2) return;
-            String txID = parts[0], type = parts[1];
+            String txID = parts[0];
+
+            // Duplicate check: ignore messages with the same txID.
+            if (processedTxIDs.contains(txID)) return;
+            processedTxIDs.add(txID);
+
+            String type = parts[1];
 
             switch (type) {
+                // ------------------ REQUESTS ------------------
+
+                // 6.1 Name request
                 case "G" -> sendResponse(address, port, txID + " H " + encode(nodeName));
-                case "H" -> addressBook.put(decode(parts[2]), new InetSocketAddress(address, port));
+
+                // 6.2 Nearest request
+                case "N" -> {
+                    String hash = parts[2].trim();
+                    List<String> keys = new ArrayList<>(addressBook.keySet());
+                    keys.removeIf(k -> !k.startsWith("N:"));
+                    keys.sort(Comparator.comparingInt(k -> {
+                        try { return distance(hash, sha256Hex(k)); }
+                        catch (Exception e) { return Integer.MAX_VALUE; }
+                    }));
+
+                    StringBuilder oReply = new StringBuilder(txID + " O");
+                    for (int i = 0; i < Math.min(3, keys.size()); i++) {
+                        String k = keys.get(i);
+                        String v = addressBook.get(k).getAddress().getHostAddress() + ":" + addressBook.get(k).getPort();
+                        oReply.append(" ").append(encode(k)).append(encode(v));
+                    }
+
+                    sendResponse(address, port, oReply.toString());
+                }
+
+                // 6.3 Info (optional to handle)
+                case "I" -> {} // Discard silently
+
+                // 6.4 Relay
+                case "V" -> {
+                    if (parts.length < 3) return;
+                    String[] relayParts = parts[2].split(" ", 2);
+                    if (relayParts.length < 2) return;
+
+                    String targetNode = relayParts[0];
+                    String actualMessage = relayParts[1];
+
+                    if (addressBook.containsKey(targetNode)) {
+                        InetSocketAddress targetAddr = addressBook.get(targetNode);
+                        sendResponse(targetAddr.getAddress(), targetAddr.getPort(), actualMessage);
+                    } else {
+                        if (debug) System.err.println("Relay failed: unknown target " + targetNode);
+                    }
+                }
+
+                // 6.5.1 Key Existence request
+                case "E" -> {
+                    String key = decode(parts[2]);
+                    boolean exists = store.containsKey(key);
+                    // NOTE: we're skipping B-check (distance logic) here
+                    char response = exists ? 'Y' : 'N';
+                    sendResponse(address, port, txID + " F " + response);
+                }
+
+                // 6.5.2 Read request
+                case "R" -> {
+                    String key = decode(parts[2]);
+                    if (store.containsKey(key))
+                        sendResponse(address, port, txID + " S Y " + encode(store.get(key)));
+                    else
+                        sendResponse(address, port, txID + " S N ");
+                }
+
+                // 6.5.3 Write request
                 case "W" -> {
                     String[] kv = decodeTwo(parts[2]);
                     if (kv != null) {
@@ -147,44 +265,78 @@ public class Node implements NodeInterface {
                         sendResponse(address, port, txID + " X A");
                     }
                 }
-                case "R" -> {
-                    String key = decode(parts[2]);
-                    if (store.containsKey(key))
-                        sendResponse(address, port, txID + " S Y " + encode(store.get(key)));
-                    else
-                        sendResponse(address, port, txID + " S N ");
+
+                // 6.5.4 Compare-and-Swap (CAS) request
+                case "C" -> {
+                    String[] partsC = decodeThree(parts[2]); // write this helper
+                    if (partsC == null) break;
+                    String key = partsC[0], currentVal = partsC[1], newVal = partsC[2];
+                    String stored = store.get(key);
+
+                    char result;
+                    if (stored == null) {
+                        store.put(key, newVal);
+                        result = 'A';
+                    } else if (stored.equals(currentVal)) {
+                        store.put(key, newVal);
+                        result = 'R';
+                    } else {
+                        result = 'N';
+                    }
+
+                    sendResponse(address, port, txID + " D " + result);
                 }
+
+                // ------------------ RESPONSES ------------------
+
+                case "H" -> {
+                    addressBook.put(decode(parts[2]), new InetSocketAddress(address, port));
+                    pendingRequests.remove(txID);
+                }
+
+                case "O" -> {
+                    nearestResponseCache.put(txID, parts[2]);
+                    pendingRequests.remove(txID);
+                }
+
                 case "S" -> {
                     String[] resp = parts[2].split(" ", 2);
                     if (resp.length > 1 && resp[0].equals("Y"))
                         lastReadResult = decode(resp[1]);
+                    pendingRequests.remove(txID);
                 }
-                case "N" -> {
-                    String hash = parts[2].trim();
-                    List<String> keys = new ArrayList<>(addressBook.keySet());
-                    keys.removeIf(k -> !k.startsWith("N:"));
-                    keys.sort(Comparator.comparingInt(k -> {
-                        try { return distance(hash, sha256Hex(k)); }
-                        catch (Exception e) { return Integer.MAX_VALUE; }
-                    }));
-                    StringBuilder oReply = new StringBuilder(txID + " O");
-                    for (int i = 0; i < Math.min(3, keys.size()); i++) {
-                        String k = keys.get(i);
-                        String v = addressBook.get(k).getAddress().getHostAddress() + ":" + addressBook.get(k).getPort();
-                        oReply.append(" ").append(encode(k)).append(encode(v));
-                    }
-                    sendResponse(address, port, oReply.toString());
-                }
-                case "O" -> nearestResponseCache.put(txID, parts[2]);
-                case "I" -> {} // Ignore welcome message
+
+                case "X" -> pendingRequests.remove(txID); // Write response
+
+                case "D" -> pendingRequests.remove(txID); // CAS response
+
+                case "F" -> pendingRequests.remove(txID); // Key existence response
             }
+
         } catch (Exception e) {
             if (debug) System.err.println("Error processing: " + e.getMessage());
         }
     }
 
+
     private void sendResponse(InetAddress address, int port, String message) {
         try {
+            // Check if the message needs to be relayed
+            if (!relayStack.isEmpty()) {
+                String relayNode = relayStack.peek();
+                InetSocketAddress relayAddress = addressBook.get(relayNode);
+
+                if (relayAddress != null) {
+                    String relayMessage = genTxID() + " V " + encode(address.getHostAddress() + ":" + port) + " " + message;
+                    byte[] data = relayMessage.getBytes();
+                    DatagramPacket relayPacket = new DatagramPacket(data, data.length, relayAddress.getAddress(), relayAddress.getPort());
+                    socket.send(relayPacket);
+                    if (debug) System.out.println("Relayed through " + relayNode + ": " + relayMessage);
+                    return;
+                }
+            }
+
+            // Normal direct message sending
             byte[] data = message.getBytes();
             DatagramPacket packet = new DatagramPacket(data, data.length, address, port);
             socket.send(packet);
@@ -209,6 +361,15 @@ public class Node implements NodeInterface {
             String[] parts = s.trim().split(" ", 4);
             return new String[]{parts[1], parts[3]};
         } catch (Exception e) { return null; }
+    }
+
+    private String[] decodeThree(String s) {
+        try {
+            String[] parts = s.trim().split(" ", 6);
+            return new String[]{parts[1], parts[3], parts[5]};
+        } catch (Exception e) {
+            return null;
+        }
     }
 
     @Override public boolean isActive(String nodeName) { return addressBook.containsKey(nodeName); }
